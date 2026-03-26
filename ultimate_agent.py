@@ -26,6 +26,29 @@ from pydeseq2.ds import DeseqStats
 # PAGE CONFIGURATION & SECRETS
 # ==========================================
 st.set_page_config(page_title="Agentic Oncology Orchestrator", layout="wide")
+
+# --- PASSWORD PROTECTION ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+    def password_entered():
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input("🔒 Enter Lab Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("🔒 Enter Lab Password", type="password", on_change=password_entered, key="password")
+        st.error("😕 Password incorrect")
+        return False
+    return True
+
+if not check_password():
+    st.stop() # Stops the rest of the app from loading until password is correct!
+
 st.title("🧬 Agentic Precision Oncology Pipeline")
 st.markdown("Powered by LangGraph, PyDESeq2, OncoKB, and PubMed")
 
@@ -167,7 +190,7 @@ def search_clinical_trials(gene, tumor_type):
 # 3. LANGGRAPH NODES
 # ==========================================
 def planner_node(state: AgentState):
-    llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=openai_key)
+    llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key)
     structured_llm = llm.with_structured_output(Plan)
     
     sys_msg = """You are an expert Clinical Bioinformatics Planner. 
@@ -191,11 +214,8 @@ def executor_node(state: AgentState):
         hugo = gene_info.get("hugo")
         alt = gene_info.get("alteration")
         tumor_type = gene_info.get("tumor_type")
-        
-        # --- NEW: We extract the source tag we created in Section 4 ---
         source_tag = gene_info.get("source", "Unknown Source")
         
-        # --- NEW: We pass the source tag directly into the AI's evidence clipboard ---
         report = {"gene": hugo, "alteration": alt, "source": source_tag, "evidence": {}}
         
         if "oncokb" in plan_text:
@@ -212,7 +232,7 @@ def executor_node(state: AgentState):
 
 def writer_node(state: AgentState):
     print("✍️ [NODE: Writer] Synthesizing the final clinical report...")
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.2, api_key=openai_key)
+    llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
     
     sys_msg = """You are an expert Clinical Oncology Medical Writer.
     Write a beautiful, multi-paragraph scientific report answering the user's prompt.
@@ -269,110 +289,124 @@ workflow.add_edge("writer", END)
 orchestrator = workflow.compile()
 
 # ==========================================
-# 4. STREAMLIT UI & MAIN EXECUTION
+# STREAMLIT FRONTEND & UI (VERSION 2.0)
 # ==========================================
-st.subheader("1. Configure Analysis")
-col1, col2 = st.columns(2) # Back to a clean 2-column layout!
+# Initialize session state variables so they survive button clicks
+if "volcano_fig" not in st.session_state:
+    st.session_state.volcano_fig = None
+if "ai_targets" not in st.session_state:
+    st.session_state.ai_targets = []
+
+col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.markdown("**Transcriptomics (RNA-Seq)**")
+    st.subheader("1. Data Upload")
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
+    
+    st.markdown("---")
+    st.subheader("2. Statistical Cutoffs")
+    
+    # --- NEW: st.form stops the twitchy reloading! ---
+    with st.form("stats_form"):
+        pval_thresh = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=0.0500, step=0.0100, format="%.4f")
+        log2fc_thresh = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
+        top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
+        
+        # This button triggers the plot update
+        update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
+
+    st.markdown("---")
+    st.subheader("3. Clinical Context")
+    cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
+    run_button = st.button("🚀 Run AI Clinical Triage", use_container_width=True, type="primary")
 
 with col2:
-    st.markdown("**Clinical Context**")
-    disease_interest = st.text_input("Cancer Type", value="Melanoma")
-    user_prompt = st.text_area(
-        "📝 AI Instructions", 
-        value="Identify potential therapeutics for the top targets. Highlight experimental PubMed literature."
-    )
+    st.subheader("Interactive Volcano Plot")
     
-    # Your requested optional dropdown menu with useful external links!
-    with st.expander("🧬 External DNA & Mutation Resources (Optional)"):
-        st.write("Cross-reference your RNA findings with known DNA mutational databases:")
-        st.markdown("- [cBioPortal for Cancer Genomics](https://www.cbioportal.org/)")
-        st.markdown("- [COSMIC (Catalogue of Somatic Mutations in Cancer)](https://cancer.sanger.ac.uk/cosmic)")
-        st.markdown("- [ClinVar](https://www.ncbi.nlm.nih.gov/clinvar/)")
-
-if st.button("Run RNA-to-Clinical Pipeline", type="primary"):
-    if counts_file and metadata_file:
-        agent_payload = []
-        
+    # Only run the heavy math if files are uploaded AND the update button was clicked
+    if counts_file and metadata_file and update_plot_btn:
         counts_df = pd.read_csv(counts_file, index_col=0)
         metadata_df = pd.read_csv(metadata_file, index_col=0)
         
-        with st.status("⚙️ Processing RNA-Seq Data...", expanded=True) as status:
-            st.write("Running PyDESeq2 Differential Expression...")
+        with st.spinner("Calculating Differential Expression..."):
             dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors="condition")
             dds.deseq2()
             stat_res = DeseqStats(dds, contrast=["condition", "Tumor", "Normal"])
             stat_res.summary()
             results_df = stat_res.results_df
-            status.update(label="PyDESeq2 Complete!", state="complete", expanded=False)
             
-        # Volcano Plot
         plot_df = results_df.dropna(subset=['padj', 'log2FoldChange']).copy()
         plot_df['-log10(padj)'] = -np.log10(plot_df['padj'] + 1e-300)
-        plot_df['Log2FC'] = plot_df['log2FoldChange'].round(2)
-        plot_df['P-value (adj)'] = plot_df['padj'].apply(lambda x: f"{x:.2e}")
         
-        conditions = [(plot_df['padj'] < 0.05) & (plot_df['log2FoldChange'] > 2), (plot_df['padj'] < 0.05) & (plot_df['log2FoldChange'] < -2)]
-        choices = ['Upregulated (Target)', 'Downregulated']
-        plot_df['Significance'] = np.select(conditions, choices, default='Not Significant')
+        conditions = [
+            (plot_df['padj'] < pval_thresh) & (plot_df['log2FoldChange'] > log2fc_thresh), 
+            (plot_df['padj'] < pval_thresh) & (plot_df['log2FoldChange'] < -log2fc_thresh)
+        ]
+        plot_df['Significance'] = np.select(conditions, ['Upregulated', 'Downregulated'], default='Not Significant')
         
+        st.session_state.ai_targets = plot_df[plot_df['Significance'] == 'Upregulated'].sort_values(by='padj').head(top_n_genes).index.tolist()
+        plot_df.loc[st.session_state.ai_targets, 'Significance'] = 'AI Selected Target'
+
         fig = px.scatter(
             plot_df, x='log2FoldChange', y='-log10(padj)', color='Significance', 
-            color_discrete_map={'Upregulated (Target)': 'red', 'Downregulated': 'blue', 'Not Significant': 'lightgrey'}, 
-            hover_name=plot_df.index, hover_data={'log2FoldChange': False, '-log10(padj)': False, 'Log2FC': True, 'P-value (adj)': True}
+            color_discrete_map={
+                'AI Selected Target': '#FFD700', 'Upregulated': '#EF553B', 
+                'Downregulated': '#636EFA', 'Not Significant': '#4A4A4A' # NEW: Dark grey for better contrast
+            },
+            hover_name=plot_df.index
         )
-        st.session_state.volcano_fig = fig
+        # --- NEW: Changed lines to white ---
+        fig.add_hline(y=-np.log10(pval_thresh), line_dash="dash", line_color="white")
+        fig.add_vline(x=log2fc_thresh, line_dash="dash", line_color="white")
+        fig.add_vline(x=-log2fc_thresh, line_dash="dash", line_color="white")
+        fig.update_layout(height=500)
+        
+        st.session_state.volcano_fig = fig # Save plot to memory
+        
+    # Always display the plot if it exists in memory, even if they clicked a different button!
+    if st.session_state.volcano_fig:
+        st.plotly_chart(st.session_state.volcano_fig, use_container_width=True)
+        
+        if len(st.session_state.ai_targets) > 0:
+            formatted_genes = ", ".join([f"`{gene}`" for gene in st.session_state.ai_targets])
+            st.success(f"✅ **{len(st.session_state.ai_targets)} Targets identified:** {formatted_genes}")
+        else:
+            st.warning("⚠️ **No targets selected.** Adjust your statistical cutoffs and update the plot.")
+    elif not counts_file or not metadata_file:
+        st.info("👈 Upload data and click 'Generate Volcano Plot' to begin.")
 
-        # THE SMART LOOKUP DICTIONARY
-        # If the RNA is highly active, we assume the most common actionable mutation to get rich OncoKB data
-        mutation_lookup = {
-            "BRAF": "V600E",
-            "EGFR": "L858R",
-            "KRAS": "G12C",
-            "PIK3CA": "H1047R",
-            "ERBB2": "Amplification"
-        }
-
-        # Extract top 3 RNA targets
-        sig_genes = results_df[(results_df['padj'] < 0.05) & (results_df['log2FoldChange'] > 2)].sort_values(by='padj').head(3)
-        for g in sig_genes.index:
-            gene_str = str(g).strip().upper()
-            
-            # Check our smart dictionary. If not found, default to Amplification.
-            assumed_alt = mutation_lookup.get(gene_str, "Amplification")
-            
-            agent_payload.append({
-                "hugo": gene_str, 
-                "alteration": assumed_alt, 
-                "tumor_type": disease_interest,
-                "source": "RNA Overexpression"
+# ==========================================
+# EXECUTE THE AI GRAPH
+# ==========================================
+if run_button and counts_file and metadata_file and len(st.session_state.ai_targets) > 0:
+    st.markdown("---")
+    st.subheader("🤖 AI Clinical Report")
+    
+    with st.spinner("Orchestrating AI Agents (Fetching OncoKB & PubMed)..."):
+        structured_genes = []
+        for gene in st.session_state.ai_targets:
+            structured_genes.append({
+                "hugo": gene,
+                "alteration": "Overexpression", 
+                "tumor_type": cancer_type,
+                "source": "PyDESeq2 Volcanic Selection"
             })
-
-        # --- LANGGRAPH EXECUTION ---
-        st.markdown("---")
-        st.subheader("🧠 AI Orchestration")
-        with st.spinner(f"The AI is building a clinical profile for {len(agent_payload)} RNA targets..."):
-            initial_state = {
-                "user_prompt": user_prompt,
-                "significant_genes": agent_payload,
-                "plan": [],
-                "gathered_evidence": [],
-                "final_report": ""
-            }
-            final_state = orchestrator.invoke(initial_state)
             
-            st.session_state.plan = final_state["plan"]
-            st.session_state.final_report = final_state["final_report"]
-            st.session_state.run_complete = True
-            st.session_state.messages = [] 
-            
-    else:
-        st.warning("Please upload RNA-Seq files (Counts + Metadata) to begin.")
-
+        initial_state = {
+            "user_prompt": f"Find targeted therapies for {cancer_type} patients with overexpression in {', '.join(st.session_state.ai_targets)}",
+            "significant_genes": structured_genes,
+            "plan": [],
+            "gathered_evidence": [],
+            "final_report": ""
+        }
+        
+        final_state = orchestrator.invoke(initial_state)
+        
+        st.session_state.run_complete = True
+        st.session_state.final_report = final_state["final_report"]
+        st.session_state.plan = final_state["plan"]
+        
 # ==========================================
 # 5. RENDER RESULTS & CHATBOT (From Memory)
 # ==========================================
@@ -392,10 +426,8 @@ if st.session_state.run_complete:
     # --- EXPORT MENU (HTML & DOCX) ---
     st.markdown("### 💾 Export Options")
     
-    # 1. Prepare the Base HTML
     html_content = markdown.markdown(st.session_state.final_report, extensions=['tables'])
     
-    # 2. Build the Styled HTML File
     styled_html = f"""
     <html>
         <head>
@@ -410,34 +442,30 @@ if st.session_state.run_complete:
         </head>
         <body>
             <h1>Clinical AI Orchestrator Report</h1>
-            <p><strong>Disease Target:</strong> {disease_interest}</p>
+            <p><strong>Disease Target:</strong> {cancer_type}</p>
             <hr>
             {html_content}
         </body>
     </html>
     """
     
-    # 3. Build the Word Document (.docx) in Memory
     doc = Document()
-    doc.add_heading(f'Clinical AI Orchestrator Report - {disease_interest}', level=1)
+    doc.add_heading(f'Clinical AI Orchestrator Report - {cancer_type}', level=1)
     
-    # Use HtmlToDocx to cleanly convert our markdown-generated HTML into Word format
     parser = HtmlToDocx()
     parser.add_html_to_document(html_content, doc)
     
-    # Save the Word doc to a virtual memory buffer
     doc_buffer = BytesIO()
     doc.save(doc_buffer)
-    doc_buffer.seek(0) # Reset the buffer pointer so Streamlit can read it from the beginning
+    doc_buffer.seek(0) 
     
-    # 4. Display the Buttons Side-by-Side
     col_down1, col_down2 = st.columns(2)
     
     with col_down1:
         st.download_button(
             label="🌐 Download as HTML (Browser/PDF)",
             data=styled_html,
-            file_name=f"{disease_interest}_Clinical_Report.html",
+            file_name=f"{cancer_type}_Clinical_Report.html",
             mime="text/html",
             use_container_width=True
         )
@@ -446,7 +474,7 @@ if st.session_state.run_complete:
         st.download_button(
             label="📄 Download as Word Document (.docx)",
             data=doc_buffer,
-            file_name=f"{disease_interest}_Clinical_Report.docx",
+            file_name=f"{cancer_type}_Clinical_Report.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )
@@ -456,12 +484,10 @@ if st.session_state.run_complete:
     st.subheader("💬 Discuss the Findings")
     st.write("Ask follow-up questions about the clinical trials, specific drugs, or resistance mechanisms mentioned above.")
     
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             
-    # Chat input
     if prompt := st.chat_input("E.g., What is the mechanism of action for CL-387785?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -469,9 +495,8 @@ if st.session_state.run_complete:
             
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                chat_llm = ChatOpenAI(model="gpt-4o", temperature=0.2, api_key=openai_key)
+                chat_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
                 
-                # Give the chat LLM the final report as its core context
                 chat_sys_msg = f"You are a helpful oncology assistant. Answer the user's questions strictly based on the following report:\n\n{st.session_state.final_report}"
                 
                 messages = [SystemMessage(content=chat_sys_msg)]
