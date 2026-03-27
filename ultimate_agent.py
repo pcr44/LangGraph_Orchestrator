@@ -13,6 +13,13 @@ from docx import Document
 from htmldocx import HtmlToDocx
 from typing import TypedDict, List, Dict, Any, Annotated
 from pydantic import BaseModel, Field
+from inmoose.edgepy import DGEList, glmFit, glmLRT
+from patsy import dmatrix
+# --- NEW RAG IMPORTS ---
+from PyPDF2 import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
 
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
@@ -74,6 +81,7 @@ class AgentState(TypedDict):
     plan: List[str]
     gathered_evidence: Annotated[List[Dict[str, Any]], operator.add]
     final_report: str
+    custom_knowledge: str # <-- NEW: Slot for the RAG data
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
@@ -186,6 +194,31 @@ def search_clinical_trials(gene, tumor_type):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
+def process_pdf_for_rag(pdf_file):
+    """Reads a PDF, splits it into chunks, and builds a FAISS vector database."""
+    reader = PdfReader(pdf_file)
+    raw_text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            raw_text += extracted
+            
+    # CRITICAL: Prevent the database from crashing if the PDF is just images!
+    if not raw_text.strip():
+        return None 
+        
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150,
+        length_function=len
+    )
+    chunks = text_splitter.split_text(raw_text)
+    
+    embeddings = OpenAIEmbeddings(api_key=openai_key)
+    vectorstore = FAISS.from_texts(chunks, embeddings)
+    
+    return vectorstore
+
 # ==========================================
 # 3. LANGGRAPH NODES
 # ==========================================
@@ -246,6 +279,7 @@ def writer_node(state: AgentState):
     2. For PubMed literature, read the Abstracts. Write a 1-2 sentence clinical summary of what the study actually found. Cite the PMID.
     3. Make all ClinicalTrials NCT IDs clickable markdown links.
     4. Important Context: Because this data originates from RNA sequencing (Overexpression), add a brief, single-sentence disclaimer at the top of the report stating: "*Note: Targeted therapies listed below typically require DNA confirmation of the specific mutation (e.g., V600E, L858R) associated with the overexpressed gene.*"
+    5. Lab Protocols: If 'Custom Lab Protocols' are provided in the context, you MUST incorporate those specific internal rules, dosing guidelines, or protocol notes into the report.
     
     REQUIRED REPORT STRUCTURE:
     You MUST format your report using this EXACT Markdown structure for EVERY gene sequentially. Do not omit the PMIDs:
@@ -266,7 +300,7 @@ def writer_node(state: AgentState):
     
     Do not deviate from this structure."""
     
-    user_context = f"User Prompt: {state.get('user_prompt')}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}"
+    user_context = f"User Prompt: {state.get('user_prompt')}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
     
     response = llm.invoke([
         SystemMessage(content=sys_msg),
@@ -306,19 +340,25 @@ with col1:
     
     st.markdown("---")
     st.subheader("2. Statistical Cutoffs")
-    
-    # --- NEW: st.form stops the twitchy reloading! ---
+    # --- The Engine Selector and Form ---
     with st.form("stats_form"):
+        de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy"])
         pval_thresh = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=0.0500, step=0.0100, format="%.4f")
         log2fc_thresh = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
         top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
         
-        # This button triggers the plot update
         update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
 
     st.markdown("---")
     st.subheader("3. Clinical Context")
     cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
+    
+    # --- NEW RAG UI ---
+    st.markdown("---")
+    st.subheader("4. Custom Knowledge (Optional)")
+    uploaded_pdf = st.file_uploader("Upload Lab Protocols/Guidelines (PDF)", type=["pdf"])
+    
+    st.markdown("---")
     run_button = st.button("🚀 Run AI Clinical Triage", use_container_width=True, type="primary")
 
 with col2:
@@ -329,12 +369,34 @@ with col2:
         counts_df = pd.read_csv(counts_file, index_col=0)
         metadata_df = pd.read_csv(metadata_file, index_col=0)
         
-        with st.spinner("Calculating Differential Expression..."):
-            dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors="condition")
-            dds.deseq2()
-            stat_res = DeseqStats(dds, contrast=["condition", "Tumor", "Normal"])
-            stat_res.summary()
-            results_df = stat_res.results_df
+        with st.spinner(f"Calculating Differential Expression using {de_engine}..."):
+            if de_engine == "PyDESeq2":
+                # --- The original PyDESeq2 logic ---
+                dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors="condition")
+                dds.deseq2()
+                stat_res = DeseqStats(dds, contrast=["condition", "Tumor", "Normal"])
+                stat_res.summary()
+                results_df = stat_res.results_df
+                
+            elif de_engine == "EdgePy":
+                # 1. Build the Design Matrix
+                design = dmatrix("~condition", data=metadata_df)
+                
+                # 2. Initialize the EdgePy DGEList (Digital Gene Expression)
+                dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col="condition", genes=counts_df.index)
+                
+                # 3. Fit the Generalized Linear Model (GLM)
+                fit = glmFit(dge_list, design=design)
+                
+                # 4. Run the Likelihood Ratio Test (LRT) for the 'condition' variable
+                lrt = glmLRT(fit)
+                
+                # 5. Extract and format the results to match our PyDESeq2 shape
+                # InMoose outputs pandas dataframes just like PyDESeq2!
+                res = lrt.table
+                results_df = pd.DataFrame(index=res.index)
+                results_df['log2FoldChange'] = res['logFC']
+                results_df['padj'] = res['FDR'] # EdgeR uses FDR instead of padj
             
         plot_df = results_df.dropna(subset=['padj', 'log2FoldChange']).copy()
         plot_df['-log10(padj)'] = -np.log10(plot_df['padj'] + 1e-300)
@@ -383,6 +445,25 @@ if run_button and counts_file and metadata_file and len(st.session_state.ai_targ
     st.markdown("---")
     st.subheader("🤖 AI Clinical Report")
     
+    # --- NEW: RAG PDF PROCESSING (BULLETPROOF VERSION) ---
+    rag_context = ""
+    if uploaded_pdf is not None:
+        try:
+            with st.spinner("📚 Reading uploaded Lab Protocol into Vector Database..."):
+                vectorstore = process_pdf_for_rag(uploaded_pdf)
+                
+                if vectorstore is None:
+                    st.warning("⚠️ Could not read text from this PDF (it might be a scanned image). Proceeding without custom knowledge.")
+                else:
+                    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+                    query = f"Protocols, guidelines, and context for {cancer_type} or genes: {', '.join(st.session_state.ai_targets)}"
+                    docs = retriever.invoke(query)
+                    rag_context = "\n\n".join([d.page_content for d in docs])
+                    st.success("✅ Custom Knowledge Base loaded and queried!")
+                    
+        except Exception as e:
+            st.warning(f"⚠️ PDF Database Error: {str(e)}. Proceeding using only public data.")
+    
     with st.spinner("Orchestrating AI Agents (Fetching OncoKB & PubMed)..."):
         structured_genes = []
         for gene in st.session_state.ai_targets:
@@ -390,7 +471,7 @@ if run_button and counts_file and metadata_file and len(st.session_state.ai_targ
                 "hugo": gene,
                 "alteration": "Overexpression", 
                 "tumor_type": cancer_type,
-                "source": "PyDESeq2 Volcanic Selection"
+                "source": "Volcanic Selection"
             })
             
         initial_state = {
@@ -398,7 +479,8 @@ if run_button and counts_file and metadata_file and len(st.session_state.ai_targ
             "significant_genes": structured_genes,
             "plan": [],
             "gathered_evidence": [],
-            "final_report": ""
+            "final_report": "",
+            "custom_knowledge": rag_context # <-- NEW: Pass the PDF text to the AI!
         }
         
         final_state = orchestrator.invoke(initial_state)
