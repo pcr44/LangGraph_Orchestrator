@@ -495,7 +495,7 @@ if run_button and counts_file and metadata_file and len(st.session_state.ai_targ
 if st.session_state.run_complete:
     st.markdown("---")
     st.subheader("📈 Gene Expression Volcano Plot")
-    st.plotly_chart(st.session_state.volcano_fig, use_container_width=True)
+    st.plotly_chart(st.session_state.volcano_fig, use_container_width=True, key="bottom_volcano_plot")
     
     with st.expander("🔍 View the AI's Strategic Plan"):
         for step in st.session_state.plan:
